@@ -1,0 +1,7 @@
+.env
+backend/.env
+.env.*
+.env
+.env.*
+backend/.env
+frontend/.env
