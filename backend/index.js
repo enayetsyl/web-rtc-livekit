@@ -922,11 +922,26 @@ app.post('/api/wb/open', async (req, res) => {
     ensureAdminish(role);
 
     const wb = getOrInitWB(roomName);
-    wb.open = true;
-    wb.sessionId = `${roomName}_${Date.now()}`;
-    wb.seq = 0;
+  
+       // If in-memory session is empty, try to recover from DB; else create new.
+       if (!wb.sessionId) {
+         if (mongoose.connection.readyState === 1) {
+           const last = await WhiteboardStroke.findOne({ roomName })
+             .sort({ ts: -1, seq: -1 })
+             .lean();
+           if (last?.sessionId) {
+             wb.sessionId = last.sessionId;
+             wb.seq = last.seq || 0;
+           }
+         }
+         if (!wb.sessionId) {
+           wb.sessionId = `${roomName}_${Date.now()}`;
+           wb.seq = 0;
+         }
+       }
 
-    // Notify sockets (so UIs can switch to 80/20 layout)
+    wb.open = true;
+    // IMPORTANT: do NOT reset wb.seq here if session already exists.
     io.to(`wb:${roomName}`).emit('wb:state', { open: true, sessionId: wb.sessionId });
 
     res.json({ ok: true, sessionId: wb.sessionId });
@@ -979,13 +994,22 @@ app.get('/api/wb/history', async (req, res) => {
     const { roomName, sessionId } = req.query || {};
     if (!roomName) return res.status(400).json({ error: 'roomName required' });
     const wb = getOrInitWB(roomName);
-    const sid = sessionId || wb.sessionId;
-    if (!sid) return res.json({ ok: true, strokes: [] });
+
+     let sid = sessionId || wb.sessionId;
+   if (!sid && mongoose.connection.readyState === 1) {
+     // Find the most recent stroke for this room to recover its session
+     const last = await WhiteboardStroke.findOne({ roomName })
+       .sort({ ts: -1, seq: -1 })
+       .lean();
+     if (last?.sessionId) sid = last.sessionId;
+   }
+   if (!sid) return res.json({ ok: true, strokes: [] });
 
     const strokes = await WhiteboardStroke
       .find({ roomName, sessionId: sid })
       .sort({ seq: 1 })
       .lean();
+
 
     res.json({ ok: true, sessionId: sid, strokes });
   } catch (e) {

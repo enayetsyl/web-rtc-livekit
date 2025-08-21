@@ -38,7 +38,7 @@ export default function Page() {
     () => new Room({ adaptiveStream: true, dynacast: true })
   );
   const [wbOpen, setWbOpen] = useState(false);
-
+  const [wbSessionId, setWbSessionId] = useState<string | null>(null);
   // 👇 store the LiveKit token we get from /api/meeting/start|join
   const [lkToken, setLkToken] = useState<string | null>(null);
 
@@ -121,17 +121,28 @@ export default function Page() {
 
   // hydrate board when it opens (replay past strokes for current session)
 useEffect(() => {
-  if (!wbOpen) return;
+  if (!wbOpen || !wbSessionId) return;
   let cancelled = false;
 
+  const waitForCanvas = async () => {
+    // poll briefly until the canvas registered __wbOnStroke
+    for (let i = 0; i < 100; i++) { // ~6s worst case
+      if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke) return;
+      await new Promise(r => setTimeout(r, 30));
+    }
+  };
+
   (async () => {
+    await waitForCanvas();
+    if (cancelled) return;
     try {
       const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
       u.searchParams.set("roomName", roomName);
+      u.searchParams.set("sessionId", wbSessionId);
       const r = await fetch(u.toString(), { cache: "no-store" });
       const d = await r.json();
       if (!cancelled && d?.ok && Array.isArray(d.strokes)) {
-        // replay
+        (globalThis as any).__wbClearLocal?.();
         for (const s of d.strokes) {
           (globalThis as any).__wbOnStroke?.(s);
         }
@@ -140,7 +151,7 @@ useEffect(() => {
   })();
 
   return () => { cancelled = true; };
-}, [wbOpen, roomName]);
+}, [wbOpen, roomName, wbSessionId]);
 
 
   async function startOrJoin(kind: "start" | "join") {
@@ -199,14 +210,62 @@ useEffect(() => {
 
     wbSocketRef.current = s;
 
+      async function waitForCanvasReady() {
+           for (let i = 0; i < 100; i++) { // ~9s max
+             if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke) return;
+             await new Promise(r => setTimeout(r, 30));
+           }
+         }
+      
+         async function hydrateWhiteboard(roomName: string, sessionId: string) {
+           await waitForCanvasReady();
+           try {
+             const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
+             u.searchParams.set("roomName", roomName);
+             u.searchParams.set("sessionId", sessionId);
+             const r = await fetch(u.toString(), { cache: "no-store" });
+             const d = await r.json();
+             if (d?.ok && Array.isArray(d.strokes)) {
+               (globalThis as any).__wbClearLocal?.();
+               for (const s of d.strokes) (globalThis as any).__wbOnStroke?.(s);
+             }
+           } catch {}
+         }
+
     // server pushes whether the board is open + current session id
-    s.on("wb:state", (st: { open: boolean }) => setWbOpen(st.open));
+      s.on("wb:state", (st: { open: boolean; sessionId?: string }) => {
+           setWbOpen(st.open);
+           if (typeof st.sessionId === "string") setWbSessionId(st.sessionId);
+           // If opened, hydrate immediately (prevents race for participants)
+           if (st.open && typeof st.sessionId === "string") {
+             hydrateWhiteboard(roomName, st.sessionId);
+           }
+         });
+
     s.on("wb:roles", (_roles: string[]) => {
       // could show a UI hint if current role can/can’t draw
     });
 
+    if (!(globalThis as any).__wbQueue) (globalThis as any).__wbQueue = [];
+    
+const queue = (globalThis as any).__wbQueue as any[];
     // forward strokes + clears to the canvas module
-    s.on("wb:stroke", (doc: any) => (globalThis as any).__wbOnStroke?.(doc));
+    const q: any[] = [];
+s.on("wb:stroke", (doc: any) => {
+  const draw = (globalThis as any).__wbOnStroke;
+  if (!draw) {
+    q.push(doc);                 // buffer until canvas mounts
+    return;
+  }
+  draw(doc);
+});
+
+s.on("wb:stroke", (doc: any) => {
+  const onStroke = (globalThis as any).__wbOnStroke;
+  if (!onStroke) { queue.push(doc); return; }
+  onStroke(doc);
+});
+
     s.on("wb:clear", () => (globalThis as any).__wbClearLocal?.());
     s.on("wb:error", (msg: string) => console.warn("[wb:error]", msg));
 
@@ -569,36 +628,57 @@ function WhiteboardCanvas({
       const cvs = canvasRef.current!;
       if (!cvs) return;
       const ctx = cvs.getContext("2d")!;
-      const w = cvs.clientWidth,
-        h = cvs.clientHeight;
-      const pts = (doc?.points || []).map((p: any) => ({
-        x: p.x * w,
-        y: p.y * h,
-      }));
-      if (pts.length < 2) return;
+      const w = cvs.clientWidth, h = cvs.clientHeight;
+    
+      const pts = (doc?.points || []).map((p: any) => ({ x: p.x * w, y: p.y * h }));
+      if (pts.length === 0) return;
+    
       ctx.save();
       if (doc.tool === "eraser") {
         ctx.globalCompositeOperation = "destination-out";
         ctx.strokeStyle = "rgba(0,0,0,1)";
+        ctx.fillStyle = "rgba(0,0,0,1)";
       } else {
         ctx.globalCompositeOperation = "source-over";
         ctx.strokeStyle = doc.color || "#111";
+        ctx.fillStyle = doc.color || "#111";
       }
       ctx.lineWidth = Math.max(1, Number(doc.size) || 3);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-      ctx.stroke();
+    
+      if (pts.length === 1) {
+        const r = ctx.lineWidth / 2;
+        ctx.beginPath();
+        ctx.arc(pts[0].x, pts[0].y, r, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+      }
       ctx.restore();
-    };
+ }
+
+ const q = (globalThis as any).__wbQueue as any[] | undefined;
+  if (q?.length) {
+    for (const doc of q) (globalThis as any).__wbOnStroke(doc);
+    q.length = 0;
+  }
+
+ (globalThis as any).__wbQueue = q || [];
+
+ return () => { (globalThis as any).__wbReady = false; };
+
+
   }, []);
 
   // canvas resize
   useEffect(() => {
     const cvs = canvasRef.current!;
     const parent = cvs.parentElement!;
+    let firstSized = false;
     const resize = () => {
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       const w = parent.clientWidth;
@@ -612,9 +692,20 @@ function WhiteboardCanvas({
       ctx.scale(dpr, dpr);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
+      firstSized = true;
     };
     resize();
-    const ro = new ResizeObserver(resize);
+    const ro = new ResizeObserver(() => {
+      resize();
+      if (firstSized) {
+        // once sized, flush queued strokes (safe no-op if empty)
+        const q = (globalThis as any).__wbQueue as any[] | undefined;
+        if (q?.length) {
+          const draw = (globalThis as any).__wbOnStroke;
+          if (draw) { for (const d of q) draw(d); q.length = 0; }
+        }
+      }
+    });
     ro.observe(parent);
     return () => ro.disconnect();
   }, []);
@@ -1471,3 +1562,4 @@ function HlsPlayer({ src }: { src: string | null }) {
     />
   );
 }
+
