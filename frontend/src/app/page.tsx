@@ -39,6 +39,7 @@ export default function Page() {
   );
   const [wbOpen, setWbOpen] = useState(false);
   const [wbSessionId, setWbSessionId] = useState<string | null>(null);
+  const wbPublishedTrackRef = useRef<MediaStreamTrack | null>(null);
   // 👇 store the LiveKit token we get from /api/meeting/start|join
   const [lkToken, setLkToken] = useState<string | null>(null);
 
@@ -120,39 +121,84 @@ export default function Page() {
   }, [room, connected]);
 
   // hydrate board when it opens (replay past strokes for current session)
-useEffect(() => {
-  if (!wbOpen || !wbSessionId) return;
-  let cancelled = false;
+  useEffect(() => {
+    if (!wbOpen || !wbSessionId) return;
+    let cancelled = false;
 
-  const waitForCanvas = async () => {
-    // poll briefly until the canvas registered __wbOnStroke
-    for (let i = 0; i < 100; i++) { // ~6s worst case
-      if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke) return;
-      await new Promise(r => setTimeout(r, 30));
-    }
-  };
-
-  (async () => {
-    await waitForCanvas();
-    if (cancelled) return;
-    try {
-      const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
-      u.searchParams.set("roomName", roomName);
-      u.searchParams.set("sessionId", wbSessionId);
-      const r = await fetch(u.toString(), { cache: "no-store" });
-      const d = await r.json();
-      if (!cancelled && d?.ok && Array.isArray(d.strokes)) {
-        (globalThis as any).__wbClearLocal?.();
-        for (const s of d.strokes) {
-          (globalThis as any).__wbOnStroke?.(s);
-        }
+    const waitForCanvas = async () => {
+      // poll briefly until the canvas registered __wbOnStroke
+      for (let i = 0; i < 100; i++) {
+        // ~6s worst case
+        if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke)
+          return;
+        await new Promise((r) => setTimeout(r, 30));
       }
-    } catch {}
-  })();
+    };
 
-  return () => { cancelled = true; };
-}, [wbOpen, roomName, wbSessionId]);
+    (async () => {
+      await waitForCanvas();
+      if (cancelled) return;
+      try {
+        const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
+        u.searchParams.set("roomName", roomName);
+        u.searchParams.set("sessionId", wbSessionId);
+        const r = await fetch(u.toString(), { cache: "no-store" });
+        const d = await r.json();
+        if (!cancelled && d?.ok && Array.isArray(d.strokes)) {
+          (globalThis as any).__wbClearLocal?.();
+          for (const s of d.strokes) {
+            (globalThis as any).__wbOnStroke?.(s);
+          }
+        }
+      } catch {}
+    })();
 
+    return () => {
+      cancelled = true;
+    };
+  }, [wbOpen, roomName, wbSessionId]);
+
+  useEffect(() => {
+    if (!connected || !isAdminish) return;
+  
+    let cancelled = false;
+  
+    async function startPublish() {
+      // wait for the canvas to exist
+      for (let i = 0; i < 100 && !cancelled; i++) {
+        const get = (globalThis as any).__wbGetCanvas as (() => HTMLCanvasElement | null) | undefined;
+        const cvs = get?.();
+        if (cvs) {
+          const stream = cvs.captureStream(20); // 20fps is fine for drawing
+          const [track] = stream.getVideoTracks();
+          await room.localParticipant.publishTrack(track, {
+            name: "Whiteboard",
+            source: Track.Source.ScreenShare,  // IMPORTANT so UI & egress treat it as screenshare
+            simulcast: true,
+          });
+          wbPublishedTrackRef.current = track;
+          return;
+        }
+        await new Promise(r => setTimeout(r, 50));
+      }
+    }
+  
+    function stopPublish() {
+      const t = wbPublishedTrackRef.current;
+      if (!t) return;
+      try {
+        room.localParticipant.unpublishTrack(t, true); // stopOnUnpublish = true
+        t.stop();
+      } catch {}
+      wbPublishedTrackRef.current = null;
+    }
+  
+    if (wbOpen) startPublish();
+    else stopPublish();
+  
+    return () => { cancelled = true; };
+  }, [wbOpen, connected, isAdminish, room]);
+  
 
   async function startOrJoin(kind: "start" | "join") {
     const resp = await fetch(
@@ -210,61 +256,66 @@ useEffect(() => {
 
     wbSocketRef.current = s;
 
-      async function waitForCanvasReady() {
-           for (let i = 0; i < 100; i++) { // ~9s max
-             if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke) return;
-             await new Promise(r => setTimeout(r, 30));
-           }
-         }
-      
-         async function hydrateWhiteboard(roomName: string, sessionId: string) {
-           await waitForCanvasReady();
-           try {
-             const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
-             u.searchParams.set("roomName", roomName);
-             u.searchParams.set("sessionId", sessionId);
-             const r = await fetch(u.toString(), { cache: "no-store" });
-             const d = await r.json();
-             if (d?.ok && Array.isArray(d.strokes)) {
-               (globalThis as any).__wbClearLocal?.();
-               for (const s of d.strokes) (globalThis as any).__wbOnStroke?.(s);
-             }
-           } catch {}
-         }
+    async function waitForCanvasReady() {
+      for (let i = 0; i < 100; i++) {
+        // ~9s max
+        if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke)
+          return;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+    }
+
+    async function hydrateWhiteboard(roomName: string, sessionId: string) {
+      await waitForCanvasReady();
+      try {
+        const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
+        u.searchParams.set("roomName", roomName);
+        u.searchParams.set("sessionId", sessionId);
+        const r = await fetch(u.toString(), { cache: "no-store" });
+        const d = await r.json();
+        if (d?.ok && Array.isArray(d.strokes)) {
+          (globalThis as any).__wbClearLocal?.();
+          for (const s of d.strokes) (globalThis as any).__wbOnStroke?.(s);
+        }
+      } catch {}
+    }
 
     // server pushes whether the board is open + current session id
-      s.on("wb:state", (st: { open: boolean; sessionId?: string }) => {
-           setWbOpen(st.open);
-           if (typeof st.sessionId === "string") setWbSessionId(st.sessionId);
-           // If opened, hydrate immediately (prevents race for participants)
-           if (st.open && typeof st.sessionId === "string") {
-             hydrateWhiteboard(roomName, st.sessionId);
-           }
-         });
+    s.on("wb:state", (st: { open: boolean; sessionId?: string }) => {
+      setWbOpen(st.open);
+      if (typeof st.sessionId === "string") setWbSessionId(st.sessionId);
+      // If opened, hydrate immediately (prevents race for participants)
+      if (st.open && typeof st.sessionId === "string") {
+        hydrateWhiteboard(roomName, st.sessionId);
+      }
+    });
 
     s.on("wb:roles", (_roles: string[]) => {
       // could show a UI hint if current role can/can’t draw
     });
 
     if (!(globalThis as any).__wbQueue) (globalThis as any).__wbQueue = [];
-    
-const queue = (globalThis as any).__wbQueue as any[];
-    // forward strokes + clears to the canvas module
-    const q: any[] = [];
-s.on("wb:stroke", (doc: any) => {
-  const draw = (globalThis as any).__wbOnStroke;
-  if (!draw) {
-    q.push(doc);                 // buffer until canvas mounts
-    return;
-  }
-  draw(doc);
-});
 
-s.on("wb:stroke", (doc: any) => {
-  const onStroke = (globalThis as any).__wbOnStroke;
-  if (!onStroke) { queue.push(doc); return; }
-  onStroke(doc);
-});
+    const queue = (globalThis as any).__wbQueue as any[];
+    // forward strokes + clears to the canvas module
+    // const q: any[] = [];
+    // s.on("wb:stroke", (doc: any) => {
+    //   const draw = (globalThis as any).__wbOnStroke;
+    //   if (!draw) {
+    //     q.push(doc); // buffer until canvas mounts
+    //     return;
+    //   }
+    //   draw(doc);
+    // });
+
+    s.on("wb:stroke", (doc: any) => {
+      const onStroke = (globalThis as any).__wbOnStroke;
+      if (!onStroke) {
+        queue.push(doc);
+        return;
+      }
+      onStroke(doc);
+    });
 
     s.on("wb:clear", () => (globalThis as any).__wbClearLocal?.());
     s.on("wb:error", (msg: string) => console.warn("[wb:error]", msg));
@@ -613,12 +664,22 @@ function WhiteboardCanvas({
   const [isDown, setIsDown] = useState(false);
   const lastPt = useRef<{ x: number; y: number } | null>(null);
 
+  // in WhiteboardCanvas
+function fillCanvasWhite(ctx: CanvasRenderingContext2D, cvs: HTMLCanvasElement) {
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, cvs.width, cvs.height);
+  ctx.restore();
+}
+
   // expose helpers for toolbar and socket listeners
   useEffect(() => {
     (globalThis as any).__wbClearLocal = () => {
       const cvs = canvasRef.current!;
       const ctx = cvs.getContext("2d")!;
       ctx.clearRect(0, 0, cvs.width, cvs.height);
+      fillCanvasWhite(ctx, cvs); 
     };
     (globalThis as any).__wbToDataURL = () => {
       const cvs = canvasRef.current!;
@@ -628,25 +689,29 @@ function WhiteboardCanvas({
       const cvs = canvasRef.current!;
       if (!cvs) return;
       const ctx = cvs.getContext("2d")!;
-      const w = cvs.clientWidth, h = cvs.clientHeight;
-    
-      const pts = (doc?.points || []).map((p: any) => ({ x: p.x * w, y: p.y * h }));
+      const w = cvs.clientWidth,
+        h = cvs.clientHeight;
+
+      const pts = (doc?.points || []).map((p: any) => ({
+        x: p.x * w,
+        y: p.y * h,
+      }));
       if (pts.length === 0) return;
-    
+
       ctx.save();
       if (doc.tool === "eraser") {
-        ctx.globalCompositeOperation = "destination-out";
-        ctx.strokeStyle = "rgba(0,0,0,1)";
-        ctx.fillStyle = "rgba(0,0,0,1)";
+        ctx.globalCompositeOperation = "source-over";
+        ctx.strokeStyle = "#ffffff";
+        ctx.fillStyle  = "#ffffff";
       } else {
         ctx.globalCompositeOperation = "source-over";
         ctx.strokeStyle = doc.color || "#111";
-        ctx.fillStyle = doc.color || "#111";
+        ctx.fillStyle  = doc.color || "#111";
       }
       ctx.lineWidth = Math.max(1, Number(doc.size) || 3);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-    
+
       if (pts.length === 1) {
         const r = ctx.lineWidth / 2;
         ctx.beginPath();
@@ -659,19 +724,22 @@ function WhiteboardCanvas({
         ctx.stroke();
       }
       ctx.restore();
- }
+    };
 
- const q = (globalThis as any).__wbQueue as any[] | undefined;
-  if (q?.length) {
-    for (const doc of q) (globalThis as any).__wbOnStroke(doc);
-    q.length = 0;
-  }
+    const q = (globalThis as any).__wbQueue as any[] | undefined;
+    if (q?.length) {
+      for (const doc of q) (globalThis as any).__wbOnStroke(doc);
+      q.length = 0;
+    }
 
- (globalThis as any).__wbQueue = q || [];
+    (globalThis as any).__wbQueue = q || [];
 
- return () => { (globalThis as any).__wbReady = false; };
+    (globalThis as any).__wbReady = true;
+    (globalThis as any).__wbGetCanvas = () => canvasRef.current;
 
-
+    return () => {
+      (globalThis as any).__wbReady = false;
+    };
   }, []);
 
   // canvas resize
@@ -693,6 +761,7 @@ function WhiteboardCanvas({
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
       firstSized = true;
+      fillCanvasWhite(ctx, cvs); 
     };
     resize();
     const ro = new ResizeObserver(() => {
@@ -702,7 +771,10 @@ function WhiteboardCanvas({
         const q = (globalThis as any).__wbQueue as any[] | undefined;
         if (q?.length) {
           const draw = (globalThis as any).__wbOnStroke;
-          if (draw) { for (const d of q) draw(d); q.length = 0; }
+          if (draw) {
+            for (const d of q) draw(d);
+            q.length = 0;
+          }
         }
       }
     });
@@ -750,9 +822,9 @@ function WhiteboardCanvas({
       lastPt.current = null;
 
       // seed batch with the initial point so receivers start at the right spot
-    const { nx, ny } = norm(e);
-    lastNorm = { x: nx, y: ny };
-    batch = [lastNorm];
+      const { nx, ny } = norm(e);
+      lastNorm = { x: nx, y: ny };
+      batch = [lastNorm];
     };
 
     const onUp = (e: PointerEvent) => {
@@ -779,15 +851,16 @@ function WhiteboardCanvas({
         size: 3,
         erase: false,
       };
+      
       // draw locally for instant feedback
       if (lastPt.current) {
         const ctx = cvs.getContext("2d")!;
         ctx.save();
         if (tools.erase) {
-          ctx.globalCompositeOperation = "destination-out";
-          ctx.strokeStyle = "rgba(0,0,0,1)";
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.strokeStyle = '#ffffff';
         } else {
-          ctx.globalCompositeOperation = "source-over";
+          ctx.globalCompositeOperation = 'source-over';
           ctx.strokeStyle = tools.color;
         }
         ctx.lineWidth = tools.size;
@@ -801,7 +874,7 @@ function WhiteboardCanvas({
       // accumulate normalized points for this stroke
 
       lastNorm = { x: nx, y: ny };
-      
+
       batch.push(lastNorm);
 
       // small debounce to send in short chunks
@@ -1562,4 +1635,3 @@ function HlsPlayer({ src }: { src: string | null }) {
     />
   );
 }
-
