@@ -1,4 +1,8 @@
 import "dotenv/config";
+import { createServer } from 'http';
+import { Server as IOServer } from 'socket.io';
+import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 import express from "express";
 import cors from "cors";
 import {
@@ -14,6 +18,11 @@ import {
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
 app.use(express.json());
+
+const server = createServer(app);
+const io = new IOServer(server, {
+  cors: { origin: process.env.CORS_ORIGIN || true },
+});
 
 const HOST = process.env.LIVEKIT_HOST; // https://<proj>.livekit.cloud
 const WS_URL = process.env.LIVEKIT_WS_URL; // wss://<proj>.livekit.cloud
@@ -41,6 +50,36 @@ const activeEgressByRoom = new Map(); // roomName -> Set<egressId>
 const ROLES = ["admin", "moderator", "participant", "observer"];
 const isAdminish = (role) => role === "admin" || role === "moderator";
 
+// ---- MongoDB (whiteboard persistence only) ----
+const MONGO = process.env.MONGODB_URI;
+if (!MONGO) {
+  console.warn('MONGODB_URI not set; whiteboard history won’t be persisted.');
+} else {
+  mongoose
+    .connect(MONGO, { dbName: 'meet' })
+    .then(() => console.log('Mongo connected'))
+    .catch((e) => console.error('Mongo connection error', e?.message || e));
+}
+
+// Minimal stroke schema: one document per stroke segment
+const WhiteboardStrokeSchema = new mongoose.Schema(
+  {
+    roomName: { type: String, index: true },
+    sessionId: { type: String, index: true }, // changes each open/close
+    seq: Number, // increasing sequence number per session
+    author: { identity: String, name: String, role: String },
+    tool: { type: String, default: 'pen' }, // 'pen' | 'eraser' (eraser is just draw with bg)
+    color: { type: String, default: '#111' },
+    size: { type: Number, default: 2 },
+    points: [{ x: Number, y: Number }], // a polyline segment
+    ts: { type: Number, default: () => Date.now() },
+  },
+  { versionKey: false }
+);
+const WhiteboardStroke = mongoose.models.WhiteboardStroke ||
+  mongoose.model('WhiteboardStroke', WhiteboardStrokeSchema);
+
+
 function ensureRole(role) {
   if (!role || !ROLES.includes(role)) {
     const err = new Error(
@@ -50,6 +89,7 @@ function ensureRole(role) {
     throw err;
   }
 }
+
 function ensureAdminish(role) {
   if (!isAdminish(role)) {
     const err = new Error("Forbidden: only admin/moderator allowed");
@@ -819,6 +859,229 @@ app.get("/api/room/participants", async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3001, () =>
-  console.log(`LiveKit backend on :${process.env.PORT || 3001}`)
+// ---- Whiteboard state (in-memory) ----
+// For each LiveKit room we track current whiteboard session + permissions
+const wbStateByRoom = new Map();
+/*
+  wbState = {
+    open: boolean,
+    sessionId: string,
+    seq: number,                 // last committed sequence
+    rolesAllowed: new Set(['admin','moderator','participant']) // default
+  }
+*/
+
+function getOrInitWB(roomName) {
+  let s = wbStateByRoom.get(roomName);
+  if (!s) {
+    s = {
+      open: false,
+      sessionId: '',
+      seq: 0,
+      rolesAllowed: new Set(['admin', 'moderator', 'participant']), // observers cannot draw
+    };
+    wbStateByRoom.set(roomName, s);
+  }
+  return s;
+}
+
+// Verify the LiveKit JWT you already mint and extract identity/role safely.
+// We expect client to pass that token when connecting Socket.IO.
+function decodeLKToken(token) {
+  // LiveKit token is a JWT signed using your API_SECRET
+  const decoded = jwt.verify(token, API_SECRET, { algorithms: ['HS256'] });
+  // LiveKit puts custom metadata as string; parse if present
+  let role = 'participant';
+  try {
+    if (decoded?.metadata) {
+      const md = JSON.parse(decoded.metadata);
+      if (md?.role) role = md.role;
+    }
+  } catch {}
+  const identity = decoded?.sub || decoded?.name || 'unknown';
+  return { identity, role };
+}
+
+function canDraw(role, wb) {
+  if (!wb?.open) return false;
+  if (!role) return false;
+  // observers never
+  if (role === 'observer') return false;
+  // default rolesAllowed contains admin/mod/participant
+  return wb.rolesAllowed.has(role);
+}
+
+// ---- Whiteboard REST ----
+
+// Open whiteboard (admin/mod only). Starts a fresh sessionId.
+app.post('/api/wb/open', async (req, res) => {
+  try {
+    const { roomName, role } = req.body || {};
+    if (!roomName) return res.status(400).json({ error: 'roomName required' });
+    ensureRole(role);
+    ensureAdminish(role);
+
+    const wb = getOrInitWB(roomName);
+    wb.open = true;
+    wb.sessionId = `${roomName}_${Date.now()}`;
+    wb.seq = 0;
+
+    // Notify sockets (so UIs can switch to 80/20 layout)
+    io.to(`wb:${roomName}`).emit('wb:state', { open: true, sessionId: wb.sessionId });
+
+    res.json({ ok: true, sessionId: wb.sessionId });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || 'Failed to open whiteboard' });
+  }
+});
+
+// Close whiteboard (admin/mod only)
+app.post('/api/wb/close', async (req, res) => {
+  try {
+    const { roomName, role } = req.body || {};
+    if (!roomName) return res.status(400).json({ error: 'roomName required' });
+    ensureRole(role);
+    ensureAdminish(role);
+
+    const wb = getOrInitWB(roomName);
+    wb.open = false;
+
+    io.to(`wb:${roomName}`).emit('wb:state', { open: false, sessionId: wb.sessionId });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || 'Failed to close whiteboard' });
+  }
+});
+
+// (Optional) Restrict or relax who can draw by role — admin/mod only
+app.post('/api/wb/roles', async (req, res) => {
+  try {
+    const { roomName, role, rolesAllowed } = req.body || {};
+    if (!roomName) return res.status(400).json({ error: 'roomName required' });
+    ensureRole(role);
+    ensureAdminish(role);
+    const valid = new Set(['admin', 'moderator', 'participant']); // observers excluded
+    const incoming = new Set((rolesAllowed || []).filter((r) => valid.has(r)));
+    const wb = getOrInitWB(roomName);
+    wb.rolesAllowed = incoming.size ? incoming : new Set(['admin', 'moderator', 'participant']);
+    io.to(`wb:${roomName}`).emit('wb:roles', Array.from(wb.rolesAllowed));
+    res.json({ ok: true, rolesAllowed: Array.from(wb.rolesAllowed) });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || 'Failed to update roles' });
+  }
+});
+
+// Fetch whiteboard history (for replay/export)
+// If sessionId omitted, returns latest (current) session strokes.
+app.get('/api/wb/history', async (req, res) => {
+  try {
+    const { roomName, sessionId } = req.query || {};
+    if (!roomName) return res.status(400).json({ error: 'roomName required' });
+    const wb = getOrInitWB(roomName);
+    const sid = sessionId || wb.sessionId;
+    if (!sid) return res.json({ ok: true, strokes: [] });
+
+    const strokes = await WhiteboardStroke
+      .find({ roomName, sessionId: sid })
+      .sort({ seq: 1 })
+      .lean();
+
+    res.json({ ok: true, sessionId: sid, strokes });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || 'Failed to fetch history' });
+  }
+});
+
+// ---- Socket.IO: Whiteboard realtime ----
+io.on('connection', (socket) => {
+  // Expect query: ?roomName=...&token=LK_JWT
+  const { roomName, token } = socket.handshake.query || {};
+
+  if (!roomName || !token) {
+    socket.emit('wb:error', 'roomName and token required');
+    return socket.disconnect(true);
+  }
+
+  // Verify LiveKit JWT to trust identity+role
+  let identity = 'unknown';
+  let role = 'participant';
+  try {
+    const dec = decodeLKToken(String(token));
+    identity = dec.identity;
+    role = dec.role;
+    ensureRole(role);
+  } catch (e) {
+    socket.emit('wb:error', 'invalid token');
+    return socket.disconnect(true);
+  }
+
+  const roomKey = `wb:${roomName}`;
+  socket.join(roomKey);
+
+  // Send current state to this client
+  const wb = getOrInitWB(String(roomName));
+  socket.emit('wb:state', { open: wb.open, sessionId: wb.sessionId });
+  socket.emit('wb:roles', Array.from(wb.rolesAllowed));
+
+  // Join/leave logs (optional)
+  // console.log(`[wb] ${identity} (${role}) connected to ${roomName}`);
+
+  // Client requests: start drawing stream (the client decides when to send strokes)
+  socket.on('wb:stroke', async (payload) => {
+    // payload = { tool, color, size, points: [{x,y},...], name? }
+    try {
+      const wb = getOrInitWB(String(roomName));
+      if (!canDraw(role, wb)) return; // ignore silently if not permitted
+      if (!Array.isArray(payload?.points) || payload.points.length === 0) return;
+
+      wb.seq += 1;
+      const strokeDoc = {
+        roomName: String(roomName),
+        sessionId: wb.sessionId,
+        seq: wb.seq,
+        author: { identity, name: payload?.name || identity, role },
+        tool: payload?.tool || 'pen',
+        color: payload?.color || '#111',
+        size: Number(payload?.size || 2),
+        points: payload.points.map((p) => ({ x: Number(p.x), y: Number(p.y) })),
+        ts: Date.now(),
+      };
+
+      // Persist if DB available
+      if (mongoose.connection.readyState === 1) {
+        try { await WhiteboardStroke.create(strokeDoc); } catch {}
+      }
+
+      // Broadcast to others in the room (including sender for idempotent UI)
+      io.to(roomKey).emit('wb:stroke', strokeDoc);
+    } catch (e) {
+      // swallow
+    }
+  });
+
+  // Clear board (admin/mod only). Frontend should confirm before sending.
+  socket.on('wb:clear', async () => {
+    try {
+      ensureAdminish(role);
+      const wb = getOrInitWB(String(roomName));
+      if (!wb.open) return;
+      // Logical clear = bump session to keep history of previous content,
+      // or do a "soft clear event" and keep same session.
+      // Here we soft-clear but keep session id; client erases canvas.
+      io.to(roomKey).emit('wb:clear');
+    } catch (e) {}
+  });
+
+  // Simple ping for presence/latency
+  socket.on('wb:ping', () => socket.emit('wb:pong', Date.now()));
+
+  socket.on('disconnect', () => {
+    // console.log(`[wb] ${identity} left ${roomName}`);
+  });
+});
+
+
+server.listen(process.env.PORT || 3001, () =>
+  console.log(`LiveKit backend + sockets on :${process.env.PORT || 3001}`)
 );
