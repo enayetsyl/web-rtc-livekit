@@ -45,6 +45,7 @@ export default function Page() {
 
   // 👇 socket reference (one per meeting)
   const wbSocketRef = useRef<Socket | null>(null);
+  const wbFrameTimerRef = useRef<number | null>(null);
 
   const isAdminish = role === "admin" || role === "moderator";
 
@@ -160,30 +161,70 @@ export default function Page() {
 
   useEffect(() => {
     if (!connected || !isAdminish) return;
-  
+
     let cancelled = false;
-  
+
     async function startPublish() {
-      // wait for the canvas to exist
       for (let i = 0; i < 100 && !cancelled; i++) {
-        const get = (globalThis as any).__wbGetCanvas as (() => HTMLCanvasElement | null) | undefined;
+        const get = (globalThis as any).__wbGetCanvas as
+          | (() => HTMLCanvasElement | null)
+          | undefined;
         const cvs = get?.();
         if (cvs) {
-          const stream = cvs.captureStream(20); // 20fps is fine for drawing
+          // low base fps; we push our own frames
+          const stream = cvs.captureStream(5);
           const [track] = stream.getVideoTracks();
+    
           await room.localParticipant.publishTrack(track, {
             name: "Whiteboard",
-            source: Track.Source.ScreenShare,  // IMPORTANT so UI & egress treat it as screenshare
-            simulcast: true,
+            source: Track.Source.ScreenShare,
+            simulcast: false, // avoid layer idle/suspend quirks for static canvases
           });
+    
           wbPublishedTrackRef.current = track;
+          try { (track as any).contentHint = "detail"; } catch {}
+    
+          const ctrack = track as unknown as CanvasCaptureMediaStreamTrack;
+          const ctx = cvs.getContext("2d")!;
+    
+          // work in CSS pixels (ctx is scaled by DPR elsewhere)
+          const dpr = Math.max(1, window.devicePixelRatio || 1);
+          const px = 1 / dpr; // exactly 1 device pixel in CSS space
+          let flip = false;
+    
+          const keepAlive = () => {
+            // draw a 1-device-pixel dot in bottom-right with a tiny luminance toggle
+            const x = Math.max(0, cvs.clientWidth - px);
+            const y = Math.max(0, cvs.clientHeight - px);
+    
+            ctx.save();
+            ctx.globalCompositeOperation = "source-over";
+            // alternate two near-whites so every tick creates an actual delta
+            ctx.fillStyle = flip ? "#fefefe" : "#fcfcfc";
+            ctx.fillRect(x, y, px, px);
+            ctx.restore();
+            flip = !flip;
+    
+            // force an encoded frame
+            ctrack.requestFrame?.();
+          };
+    
+          keepAlive(); // immediate
+          wbFrameTimerRef.current = window.setInterval(keepAlive, 250); // 4 fps heartbeat
+    
           return;
         }
-        await new Promise(r => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 50));
       }
     }
-  
+    
+
     function stopPublish() {
+      if (wbFrameTimerRef.current) {
+        clearInterval(wbFrameTimerRef.current);
+        wbFrameTimerRef.current = null;
+      }
+
       const t = wbPublishedTrackRef.current;
       if (!t) return;
       try {
@@ -192,13 +233,14 @@ export default function Page() {
       } catch {}
       wbPublishedTrackRef.current = null;
     }
-  
+
     if (wbOpen) startPublish();
     else stopPublish();
-  
-    return () => { cancelled = true; };
+
+    return () => {
+      cancelled = true;
+    };
   }, [wbOpen, connected, isAdminish, room]);
-  
 
   async function startOrJoin(kind: "start" | "join") {
     const resp = await fetch(
@@ -665,13 +707,16 @@ function WhiteboardCanvas({
   const lastPt = useRef<{ x: number; y: number } | null>(null);
 
   // in WhiteboardCanvas
-function fillCanvasWhite(ctx: CanvasRenderingContext2D, cvs: HTMLCanvasElement) {
-  ctx.save();
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, cvs.width, cvs.height);
-  ctx.restore();
-}
+  function fillCanvasWhite(
+    ctx: CanvasRenderingContext2D,
+    cvs: HTMLCanvasElement
+  ) {
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, cvs.width, cvs.height);
+    ctx.restore();
+  }
 
   // expose helpers for toolbar and socket listeners
   useEffect(() => {
@@ -679,7 +724,7 @@ function fillCanvasWhite(ctx: CanvasRenderingContext2D, cvs: HTMLCanvasElement) 
       const cvs = canvasRef.current!;
       const ctx = cvs.getContext("2d")!;
       ctx.clearRect(0, 0, cvs.width, cvs.height);
-      fillCanvasWhite(ctx, cvs); 
+      fillCanvasWhite(ctx, cvs);
     };
     (globalThis as any).__wbToDataURL = () => {
       const cvs = canvasRef.current!;
@@ -702,11 +747,11 @@ function fillCanvasWhite(ctx: CanvasRenderingContext2D, cvs: HTMLCanvasElement) 
       if (doc.tool === "eraser") {
         ctx.globalCompositeOperation = "source-over";
         ctx.strokeStyle = "#ffffff";
-        ctx.fillStyle  = "#ffffff";
+        ctx.fillStyle = "#ffffff";
       } else {
         ctx.globalCompositeOperation = "source-over";
         ctx.strokeStyle = doc.color || "#111";
-        ctx.fillStyle  = doc.color || "#111";
+        ctx.fillStyle = doc.color || "#111";
       }
       ctx.lineWidth = Math.max(1, Number(doc.size) || 3);
       ctx.lineCap = "round";
@@ -761,7 +806,7 @@ function fillCanvasWhite(ctx: CanvasRenderingContext2D, cvs: HTMLCanvasElement) 
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
       firstSized = true;
-      fillCanvasWhite(ctx, cvs); 
+      fillCanvasWhite(ctx, cvs);
     };
     resize();
     const ro = new ResizeObserver(() => {
@@ -851,16 +896,16 @@ function fillCanvasWhite(ctx: CanvasRenderingContext2D, cvs: HTMLCanvasElement) 
         size: 3,
         erase: false,
       };
-      
+
       // draw locally for instant feedback
       if (lastPt.current) {
         const ctx = cvs.getContext("2d")!;
         ctx.save();
         if (tools.erase) {
-          ctx.globalCompositeOperation = 'source-over';
-          ctx.strokeStyle = '#ffffff';
+          ctx.globalCompositeOperation = "source-over";
+          ctx.strokeStyle = "#ffffff";
         } else {
-          ctx.globalCompositeOperation = 'source-over';
+          ctx.globalCompositeOperation = "source-over";
           ctx.strokeStyle = tools.color;
         }
         ctx.lineWidth = tools.size;
