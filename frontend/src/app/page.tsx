@@ -12,7 +12,7 @@ import {
 } from "@livekit/components-react";
 import "@livekit/components-styles";
 import Hls from "hls.js";
-import type { RemoteParticipant } from "livekit-client";
+import type { RemoteParticipant, LocalTrackPublication, LocalTrack   } from "livekit-client";
 import type {
   Participant,
   TrackPublication,
@@ -44,7 +44,7 @@ export default function Page() {
 
   // 👇 socket reference (one per meeting)
   const wbSocketRef = useRef<Socket | null>(null);
-
+    
   const isAdminish = role === "admin" || role === "moderator";
 
   useEffect(() => {
@@ -617,15 +617,24 @@ function WhiteboardCanvas({
 
   const lkRoom = useContext(RoomContext);
 
-  const publishedRef = useRef<MediaStreamTrack | null>(null);
-
+  const publishedRef = useRef<LocalTrackPublication | null>(null);
+  const keepAliveRef = useRef<number | null>(null);
   // expose helpers for toolbar and socket listeners
   useEffect(() => {
-    (globalThis as any).__wbClearLocal = () => {
-      const cvs = canvasRef.current!;
-      const ctx = cvs.getContext("2d")!;
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-    };
+      (globalThis as any).__wbClearLocal = () => {
+          const cvs = canvasRef.current!;
+          const ctx = cvs.getContext("2d")!;
+          // Fill opaque white so captured video isn't transparent/black
+          ctx.save();
+          ctx.globalCompositeOperation = "source-over";
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, cvs.clientWidth, cvs.clientHeight);
+          ctx.restore();
+        };
+      
+        // Initialize with a white background
+        (globalThis as any).__wbClearLocal?.();
+
     (globalThis as any).__wbToDataURL = () => {
       const cvs = canvasRef.current!;
       return cvs.toDataURL("image/png");
@@ -640,15 +649,15 @@ function WhiteboardCanvas({
       if (pts.length === 0) return;
     
       ctx.save();
-      if (doc.tool === "eraser") {
-        ctx.globalCompositeOperation = "destination-out";
-        ctx.strokeStyle = "rgba(0,0,0,1)";
-        ctx.fillStyle = "rgba(0,0,0,1)";
-      } else {
-        ctx.globalCompositeOperation = "source-over";
-        ctx.strokeStyle = doc.color || "#111";
-        ctx.fillStyle = doc.color || "#111";
-      }
+       ctx.globalCompositeOperation = "source-over";
+       if (doc.tool === "eraser") {
+         // Cover with white so HLS shows a true 'erase' over a white base
+         ctx.strokeStyle = "#ffffff";
+         ctx.fillStyle = "#ffffff";
+       } else {
+         ctx.strokeStyle = doc.color || "#111";
+         ctx.fillStyle = doc.color || "#111";
+       }
       ctx.lineWidth = Math.max(1, Number(doc.size) || 3);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
@@ -698,6 +707,8 @@ function WhiteboardCanvas({
       ctx.scale(dpr, dpr);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
+         ctx.fillStyle = "#ffffff";
+   ctx.fillRect(0, 0, w, h);
       firstSized = true;
     };
     resize();
@@ -789,13 +800,8 @@ function WhiteboardCanvas({
       if (lastPt.current) {
         const ctx = cvs.getContext("2d")!;
         ctx.save();
-        if (tools.erase) {
-          ctx.globalCompositeOperation = "destination-out";
-          ctx.strokeStyle = "rgba(0,0,0,1)";
-        } else {
-          ctx.globalCompositeOperation = "source-over";
-          ctx.strokeStyle = tools.color;
-        }
+         ctx.globalCompositeOperation = "source-over";
+         ctx.strokeStyle = tools.erase ? "#ffffff" : tools.color;
         ctx.lineWidth = tools.size;
         ctx.beginPath();
         ctx.moveTo(lastPt.current.x, lastPt.current.y);
@@ -837,18 +843,32 @@ function WhiteboardCanvas({
     if (!cvs) return;
   
     // 30fps canvas capture
-    const stream = cvs.captureStream(30);
-    const vtrack = stream.getVideoTracks()[0];
-    if (!vtrack) return;
-  
+     const stream = cvs.captureStream(30);
+     const vtrack = stream.getVideoTracks()[0];
+     if (!vtrack) return;
+     try { (vtrack as any).contentHint = "detail"; } catch {}
+
     let cancelled = false;
     (async () => {
       try {
-        await lkRoom.localParticipant.publishTrack(vtrack, {
+        const pub = await lkRoom.localParticipant.publishTrack(vtrack, {
           source: Track.Source.ScreenShare,
           name: "Whiteboard",
         });
-        if (!cancelled) publishedRef.current = vtrack;
+        if (!cancelled) publishedRef.current = pub;
+                const ctx = cvs.getContext("2d")!;
+        let toggle = false;
+        keepAliveRef.current = window.setInterval(() => {
+          // draw a 1px “heartbeat” in the bottom-right corner.
+          // toggle between two whites so browsers treat it as a change.
+          ctx.save();
+          ctx.globalCompositeOperation = "source-over";
+          const px = cvs.clientWidth - 1, py = cvs.clientHeight - 1;
+          ctx.fillStyle = toggle ? "#ffffff" : "#fefefe";
+          ctx.fillRect(px, py, 1, 1);
+          ctx.restore();
+          toggle = !toggle;
+        }, 1000); // 1 fps is plenty
       } catch (e) {
         // Publishing can fail if permissions change; safe to ignore here.
         console.warn("[wb] publish failed:", (e as any)?.message || e);
@@ -858,14 +878,24 @@ function WhiteboardCanvas({
   
     return () => {
       cancelled = true;
-      const t = publishedRef.current;
-      publishedRef.current = null;
-      if (!lkRoom) return;
-      if (t) {
-        try { lkRoom.localParticipant.unpublishTrack(t); } catch {}
-        try { t.stop(); } catch {}
+            if (keepAliveRef.current) {
+                clearInterval(keepAliveRef.current);
+                keepAliveRef.current = null;
+              }
+         const pub = publishedRef.current;
+         publishedRef.current = null;
+         if (!lkRoom) return;
+         if (pub) {
+             const t = pub.track as LocalTrack | undefined;
+             if (t) {
+               try { lkRoom.localParticipant.unpublishTrack(t); } catch {}
+               try { t.stop(); } catch {}
+             }
+            }
+        
+         try { lkRoom.localParticipant.setScreenShareEnabled(false); } catch {}
       }
-    };
+   
   }, [publishFromCanvas, lkRoom]);
 
   return (
@@ -1605,4 +1635,6 @@ function HlsPlayer({ src }: { src: string | null }) {
     />
   );
 }
+
+
 
