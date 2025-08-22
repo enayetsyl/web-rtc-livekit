@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useContext } from "react";
 import { Room, RoomEvent, DisconnectReason } from "livekit-client";
 import {
   RoomContext,
@@ -466,7 +466,7 @@ s.on("wb:stroke", (doc: any) => {
               }}
             >
               <WhiteboardToolbar socketRef={wbSocketRef} />
-              <WhiteboardCanvas socketRef={wbSocketRef} />
+              <WhiteboardCanvas socketRef={wbSocketRef} publishFromCanvas={isAdminish} />
             </div>
           )}
 
@@ -606,12 +606,18 @@ function WhiteboardToolbar({
 
 function WhiteboardCanvas({
   socketRef,
+  publishFromCanvas,
 }: {
   socketRef: React.MutableRefObject<Socket | null>;
+  publishFromCanvas: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDown, setIsDown] = useState(false);
   const lastPt = useRef<{ x: number; y: number } | null>(null);
+
+  const lkRoom = useContext(RoomContext);
+
+  const publishedRef = useRef<MediaStreamTrack | null>(null);
 
   // expose helpers for toolbar and socket listeners
   useEffect(() => {
@@ -824,6 +830,43 @@ function WhiteboardCanvas({
       cvs.removeEventListener("pointermove", onMove);
     };
   }, [socketRef, isDown, norm]);
+
+  useEffect(() => {
+    if (!publishFromCanvas || !lkRoom) return;
+    const cvs = canvasRef.current;
+    if (!cvs) return;
+  
+    // 30fps canvas capture
+    const stream = cvs.captureStream(30);
+    const vtrack = stream.getVideoTracks()[0];
+    if (!vtrack) return;
+  
+    let cancelled = false;
+    (async () => {
+      try {
+        await lkRoom.localParticipant.publishTrack(vtrack, {
+          source: Track.Source.ScreenShare,
+          name: "Whiteboard",
+        });
+        if (!cancelled) publishedRef.current = vtrack;
+      } catch (e) {
+        // Publishing can fail if permissions change; safe to ignore here.
+        console.warn("[wb] publish failed:", (e as any)?.message || e);
+        try { vtrack.stop(); } catch {}
+      }
+    })();
+  
+    return () => {
+      cancelled = true;
+      const t = publishedRef.current;
+      publishedRef.current = null;
+      if (!lkRoom) return;
+      if (t) {
+        try { lkRoom.localParticipant.unpublishTrack(t); } catch {}
+        try { t.stop(); } catch {}
+      }
+    };
+  }, [publishFromCanvas, lkRoom]);
 
   return (
     <canvas
