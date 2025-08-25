@@ -12,7 +12,11 @@ import {
 } from "@livekit/components-react";
 import "@livekit/components-styles";
 import Hls from "hls.js";
-import type { RemoteParticipant, LocalTrackPublication, LocalTrack   } from "livekit-client";
+import type {
+  RemoteParticipant,
+  LocalTrackPublication,
+  LocalTrack,
+} from "livekit-client";
 import type {
   Participant,
   TrackPublication,
@@ -44,7 +48,7 @@ export default function Page() {
 
   // 👇 socket reference (one per meeting)
   const wbSocketRef = useRef<Socket | null>(null);
-    
+
   const isAdminish = role === "admin" || role === "moderator";
 
   useEffect(() => {
@@ -120,39 +124,42 @@ export default function Page() {
   }, [room, connected]);
 
   // hydrate board when it opens (replay past strokes for current session)
-useEffect(() => {
-  if (!wbOpen || !wbSessionId) return;
-  let cancelled = false;
+  useEffect(() => {
+    if (!wbOpen || !wbSessionId) return;
+    let cancelled = false;
 
-  const waitForCanvas = async () => {
-    // poll briefly until the canvas registered __wbOnStroke
-    for (let i = 0; i < 100; i++) { // ~6s worst case
-      if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke) return;
-      await new Promise(r => setTimeout(r, 30));
-    }
-  };
-
-  (async () => {
-    await waitForCanvas();
-    if (cancelled) return;
-    try {
-      const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
-      u.searchParams.set("roomName", roomName);
-      u.searchParams.set("sessionId", wbSessionId);
-      const r = await fetch(u.toString(), { cache: "no-store" });
-      const d = await r.json();
-      if (!cancelled && d?.ok && Array.isArray(d.strokes)) {
-        (globalThis as any).__wbClearLocal?.();
-        for (const s of d.strokes) {
-          (globalThis as any).__wbOnStroke?.(s);
-        }
+    const waitForCanvas = async () => {
+      // poll briefly until the canvas registered __wbOnStroke
+      for (let i = 0; i < 100; i++) {
+        // ~6s worst case
+        if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke)
+          return;
+        await new Promise((r) => setTimeout(r, 30));
       }
-    } catch {}
-  })();
+    };
 
-  return () => { cancelled = true; };
-}, [wbOpen, roomName, wbSessionId]);
+    (async () => {
+      await waitForCanvas();
+      if (cancelled) return;
+      try {
+        const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
+        u.searchParams.set("roomName", roomName);
+        u.searchParams.set("sessionId", wbSessionId);
+        const r = await fetch(u.toString(), { cache: "no-store" });
+        const d = await r.json();
+        if (!cancelled && d?.ok && Array.isArray(d.strokes)) {
+          (globalThis as any).__wbClearLocal?.();
+          for (const s of d.strokes) {
+            (globalThis as any).__wbOnStroke?.(s);
+          }
+        }
+      } catch {}
+    })();
 
+    return () => {
+      cancelled = true;
+    };
+  }, [wbOpen, roomName, wbSessionId]);
 
   async function startOrJoin(kind: "start" | "join") {
     const resp = await fetch(
@@ -210,62 +217,78 @@ useEffect(() => {
 
     wbSocketRef.current = s;
 
-      async function waitForCanvasReady() {
-           for (let i = 0; i < 100; i++) { // ~9s max
-             if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke) return;
-             await new Promise(r => setTimeout(r, 30));
-           }
-         }
-      
-         async function hydrateWhiteboard(roomName: string, sessionId: string) {
-           await waitForCanvasReady();
-           try {
-             const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
-             u.searchParams.set("roomName", roomName);
-             u.searchParams.set("sessionId", sessionId);
-             const r = await fetch(u.toString(), { cache: "no-store" });
-             const d = await r.json();
-             if (d?.ok && Array.isArray(d.strokes)) {
-               (globalThis as any).__wbClearLocal?.();
-               for (const s of d.strokes) (globalThis as any).__wbOnStroke?.(s);
-             }
-           } catch {}
-         }
+    if (!(globalThis as any).__wbQueue) (globalThis as any).__wbQueue = [];
+  const q = (globalThis as any).__wbQueue as any[];
+
+    async function waitForCanvasReady() {
+      for (let i = 0; i < 100; i++) {
+        // ~9s max
+        if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke)
+          return;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+    }
+
+    async function hydrateWhiteboard(roomName: string, sessionId: string) {
+      await waitForCanvasReady();
+      try {
+        const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
+        u.searchParams.set("roomName", roomName);
+        u.searchParams.set("sessionId", sessionId);
+        if (sessionId) u.searchParams.set("sessionId", sessionId);
+        const r = await fetch(u.toString(), { cache: "no-store" });
+        const d = await r.json();
+        if (d?.ok && Array.isArray(d.strokes)) {
+          (globalThis as any).__wbClearLocal?.();
+          for (const s of d.strokes) (globalThis as any).__wbOnStroke?.(s);
+        }
+      } catch {}
+    }
 
     // server pushes whether the board is open + current session id
-      s.on("wb:state", (st: { open: boolean; sessionId?: string }) => {
-           setWbOpen(st.open);
-           if (typeof st.sessionId === "string") setWbSessionId(st.sessionId);
-           // If opened, hydrate immediately (prevents race for participants)
-           if (st.open && typeof st.sessionId === "string") {
-             hydrateWhiteboard(roomName, st.sessionId);
-           }
-         });
+    s.on("wb:state", (st: { open: boolean; sessionId?: string }) => {
+      setWbOpen(st.open);
+      if (typeof st.sessionId === "string") setWbSessionId(st.sessionId);
+      // If opened, hydrate immediately (prevents race for participants)
+      if (st.open && typeof st.sessionId === "string") {
+        hydrateWhiteboard(roomName, st.sessionId);
+      }
+    });
 
     s.on("wb:roles", (_roles: string[]) => {
       // could show a UI hint if current role can/can’t draw
     });
 
-    if (!(globalThis as any).__wbQueue) (globalThis as any).__wbQueue = [];
-    
-const queue = (globalThis as any).__wbQueue as any[];
-    // forward strokes + clears to the canvas module
-    const q: any[] = [];
-s.on("wb:stroke", (doc: any) => {
-  const draw = (globalThis as any).__wbOnStroke;
-  if (!draw) {
-    q.push(doc);                 // buffer until canvas mounts
-    return;
-  }
-  draw(doc);
-});
+    s.on("wb:stroke", (doc: any) => {
+      console.log("[wb:stroke]", doc.shape, doc.points?.length, doc); // <— log
+      const draw = (globalThis as any).__wbOnStroke;
+      if (!draw) {
+        q.push(doc); // buffer until canvas mounts
+        return;
+      }
+      draw(doc);
+    });
 
-s.on("wb:stroke", (doc: any) => {
-  const onStroke = (globalThis as any).__wbOnStroke;
-  if (!onStroke) { queue.push(doc); return; }
-  onStroke(doc);
-});
+    s.on("wb:refresh", async () => {
+      try {
+        const base = `${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`;
+        const u = new URL(base);
+        u.searchParams.set("roomName", roomName);
+        // omit sessionId -> server uses current session
+        const r = await fetch(u.toString(), { cache: "no-store" });
+        const d = await r.json();
+        if (d?.ok && Array.isArray(d.strokes)) {
+          (globalThis as any).__wbClearLocal?.();
+          for (const s of d.strokes) (globalThis as any).__wbOnStroke?.(s);
+        }
+      } catch {}
+    });
 
+    s.on("connect", () => console.log("[wb] socket connected", s.id));
+s.on("disconnect", (reason) => console.warn("[wb] socket disconnected:", reason));
+s.on("connect_error", (err) =>
+  console.error("[wb] connect_error:", err?.message || err)
+);
     s.on("wb:clear", () => (globalThis as any).__wbClearLocal?.());
     s.on("wb:error", (msg: string) => console.warn("[wb:error]", msg));
 
@@ -466,7 +489,10 @@ s.on("wb:stroke", (doc: any) => {
               }}
             >
               <WhiteboardToolbar socketRef={wbSocketRef} />
-              <WhiteboardCanvas socketRef={wbSocketRef} publishFromCanvas={isAdminish} />
+              <WhiteboardCanvas
+                socketRef={wbSocketRef}
+                publishFromCanvas={isAdminish}
+              />
             </div>
           )}
 
@@ -526,10 +552,25 @@ const dec = new TextDecoder();
 function useWbTools() {
   const [color, setColor] = useState<string>("#111111");
   const [size, setSize] = useState<number>(3);
-  const [erase, setErase] = useState<boolean>(false);
+  const [tool, setTool] = useState<
+    "pen" | "eraser" | "line" | "rect" | "circle" | "text"
+  >("pen");
+  const [text, setText] = useState<string>("");
+  const [fontSize, setFontSize] = useState<number>(18);
   // expose as a context-ish singleton (since we’re a single file)
-  (globalThis as any).__wbTools = { color, size, erase };
-  return { color, setColor, size, setSize, erase, setErase };
+  (globalThis as any).__wbTools = { color, size, tool, text, fontSize };
+  return {
+    color,
+    setColor,
+    size,
+    setSize,
+    tool,
+    setTool,
+    text,
+    setText,
+    fontSize,
+    setFontSize,
+  };
 }
 
 function WhiteboardToolbar({
@@ -537,7 +578,18 @@ function WhiteboardToolbar({
 }: {
   socketRef: React.MutableRefObject<Socket | null>;
 }) {
-  const { color, setColor, size, setSize, erase, setErase } = useWbTools();
+  const {
+    color,
+    setColor,
+    size,
+    setSize,
+    tool,
+    setTool,
+    text,
+    setText,
+    fontSize,
+    setFontSize,
+  } = useWbTools();
   return (
     <div
       style={{
@@ -547,9 +599,21 @@ function WhiteboardToolbar({
         padding: 8,
         background: "white",
         borderBottom: "1px solid #eee",
+        color: "black",
       }}
     >
       <span style={{ fontWeight: 600 }}>Whiteboard</span>
+      <label>
+        Tool:{" "}
+        <select value={tool} onChange={(e) => setTool(e.target.value as any)}>
+          <option value="pen">Pen</option>
+          <option value="eraser">Eraser</option>
+          <option value="line">Line</option>
+          <option value="rect">Rectangle</option>
+          <option value="circle">Circle</option>
+          <option value="text">Text</option>
+        </select>
+      </label>
       <label>
         Color:{" "}
         <input
@@ -568,14 +632,38 @@ function WhiteboardToolbar({
           onChange={(e) => setSize(Number(e.target.value))}
         />
       </label>
-      <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
-        <input
-          type="checkbox"
-          checked={erase}
-          onChange={(e) => setErase(e.target.checked)}
-        />{" "}
-        Eraser
-      </label>
+      {tool === "text" && (
+        <>
+          <input
+            placeholder="Your text…"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            style={{ width: 220 }}
+          />
+          <label>
+            Font:{" "}
+            <input
+              type="range"
+              min={10}
+              max={64}
+              value={fontSize}
+              onChange={(e) => setFontSize(Number(e.target.value))}
+            />
+          </label>
+        </>
+      )}
+      <button
+        className="lk-button"
+        onClick={() => socketRef.current?.emit("wb:undo")}
+      >
+        Undo
+      </button>
+      <button
+        className="lk-button"
+        onClick={() => socketRef.current?.emit("wb:redo")}
+      >
+        Redo
+      </button>
       <button
         className="lk-button"
         onClick={() => {
@@ -613,6 +701,7 @@ function WhiteboardCanvas({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDown, setIsDown] = useState(false);
+  const isDownRef = useRef(false); 
   const lastPt = useRef<{ x: number; y: number } | null>(null);
 
   const lkRoom = useContext(RoomContext);
@@ -620,20 +709,22 @@ function WhiteboardCanvas({
   const publishedRef = useRef<LocalTrackPublication | null>(null);
   const keepAliveRef = useRef<number | null>(null);
   // expose helpers for toolbar and socket listeners
+
   useEffect(() => {
-      (globalThis as any).__wbClearLocal = () => {
-          const cvs = canvasRef.current!;
-          const ctx = cvs.getContext("2d")!;
-          // Fill opaque white so captured video isn't transparent/black
-          ctx.save();
-          ctx.globalCompositeOperation = "source-over";
-          ctx.fillStyle = "#ffffff";
-          ctx.fillRect(0, 0, cvs.clientWidth, cvs.clientHeight);
-          ctx.restore();
-        };
-      
-        // Initialize with a white background
-        (globalThis as any).__wbClearLocal?.();
+    (globalThis as any).__wbReady = true;
+    (globalThis as any).__wbClearLocal = () => {
+      const cvs = canvasRef.current!;
+      const ctx = cvs.getContext("2d")!;
+      // Fill opaque white so captured video isn't transparent/black
+      ctx.save();
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, cvs.clientWidth, cvs.clientHeight);
+      ctx.restore();
+    };
+
+    // Initialize with a white background
+    (globalThis as any).__wbClearLocal?.();
 
     (globalThis as any).__wbToDataURL = () => {
       const cvs = canvasRef.current!;
@@ -643,50 +734,96 @@ function WhiteboardCanvas({
       const cvs = canvasRef.current!;
       if (!cvs) return;
       const ctx = cvs.getContext("2d")!;
-      const w = cvs.clientWidth, h = cvs.clientHeight;
-    
-      const pts = (doc?.points || []).map((p: any) => ({ x: p.x * w, y: p.y * h }));
+      const w = cvs.clientWidth,
+        h = cvs.clientHeight;
+
+      const pts = (doc?.points || []).map((p: any) => ({
+        x: p.x * w,
+        y: p.y * h,
+      }));
       if (pts.length === 0) return;
-    
+
       ctx.save();
-       ctx.globalCompositeOperation = "source-over";
-       if (doc.tool === "eraser") {
-         // Cover with white so HLS shows a true 'erase' over a white base
-         ctx.strokeStyle = "#ffffff";
-         ctx.fillStyle = "#ffffff";
-       } else {
-         ctx.strokeStyle = doc.color || "#111";
-         ctx.fillStyle = doc.color || "#111";
-       }
+      ctx.globalCompositeOperation = "source-over";
+      const isErase = doc.tool === "eraser";
+      const color = isErase ? "#ffffff" : doc.color || "#111";
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
       ctx.lineWidth = Math.max(1, Number(doc.size) || 3);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-    
-      if (pts.length === 1) {
-        const r = ctx.lineWidth / 2;
-        ctx.beginPath();
-        ctx.arc(pts[0].x, pts[0].y, r, 0, Math.PI * 2);
-        ctx.fill();
+
+      const shape = doc.shape || "free";
+
+      if (shape === "text") {
+        const p = pts[0];
+        const fs = Math.max(10, Number(doc.fontSize || 18));
+        ctx.font = `${fs}px sans-serif`;
+        ctx.textBaseline = "top";
+        ctx.fillText(String(doc.text || ""), p.x, p.y);
+      } else if (shape === "line") {
+        if (pts.length >= 2) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+          ctx.stroke();
+        }
+      } else if (shape === "rect") {
+        if (pts.length >= 2) {
+          const x1 = pts[0].x,
+            y1 = pts[0].y;
+          const x2 = pts[pts.length - 1].x,
+            y2 = pts[pts.length - 1].y;
+          ctx.strokeRect(
+            Math.min(x1, x2),
+            Math.min(y1, y2),
+            Math.abs(x2 - x1),
+            Math.abs(y2 - y1)
+          );
+        }
+      } else if (shape === "circle") {
+        if (pts.length >= 2) {
+          const x1 = pts[0].x,
+            y1 = pts[0].y;
+          const x2 = pts[pts.length - 1].x,
+            y2 = pts[pts.length - 1].y;
+          const cx = (x1 + x2) / 2,
+            cy = (y1 + y2) / 2;
+          const rx = Math.abs(x2 - x1) / 2;
+          const ry = Math.abs(y2 - y1) / 2;
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+          ctx.stroke();
+        }
       } else {
-        ctx.beginPath();
-        ctx.moveTo(pts[0].x, pts[0].y);
-        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-        ctx.stroke();
+        // 'free' (pen/eraser)
+        if (pts.length === 1) {
+          const r = ctx.lineWidth / 2;
+          ctx.beginPath();
+          ctx.arc(pts[0].x, pts[0].y, r, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+          ctx.stroke();
+        }
       }
+
       ctx.restore();
- }
+    };
 
- const q = (globalThis as any).__wbQueue as any[] | undefined;
-  if (q?.length) {
-    for (const doc of q) (globalThis as any).__wbOnStroke(doc);
-    q.length = 0;
-  }
+    const q = (globalThis as any).__wbQueue as any[] | undefined;
+    if (q?.length) {
+      for (const doc of q) (globalThis as any).__wbOnStroke(doc);
+      q.length = 0;
+    }
 
- (globalThis as any).__wbQueue = q || [];
+    (globalThis as any).__wbQueue = q || [];
 
- return () => { (globalThis as any).__wbReady = false; };
-
-
+    return () => {
+      (globalThis as any).__wbReady = false;
+    };
   }, []);
 
   // canvas resize
@@ -707,8 +844,8 @@ function WhiteboardCanvas({
       ctx.scale(dpr, dpr);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-         ctx.fillStyle = "#ffffff";
-   ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
       firstSized = true;
     };
     resize();
@@ -719,7 +856,10 @@ function WhiteboardCanvas({
         const q = (globalThis as any).__wbQueue as any[] | undefined;
         if (q?.length) {
           const draw = (globalThis as any).__wbOnStroke;
-          if (draw) { for (const d of q) draw(d); q.length = 0; }
+          if (draw) {
+            for (const d of q) draw(d);
+            q.length = 0;
+          }
         }
       }
     });
@@ -735,26 +875,30 @@ function WhiteboardCanvas({
     return { x, y, nx: x / rect.width, ny: y / rect.height };
   }, []);
 
-  // pointer drawing -> emit wb:stroke with a small polyline batch
+  // pointer drawing -> emit wb:stroke (free) or one-shot shapes/text
   useEffect(() => {
     const cvs = canvasRef.current!;
+
     let batch: { x: number; y: number }[] = [];
     let flushTimer: any = null;
-
     let lastNorm: { x: number; y: number } | null = null;
+    let startNorm: { x: number; y: number } | null = null;
+    let snapshot: ImageData | null = null; // for shape preview
 
     const flush = () => {
       if (!batch.length) return;
       const tools = (globalThis as any).__wbTools || {
         color: "#111",
         size: 3,
-        erase: false,
+        tool: "pen",
+        text: "",
+        fontSize: 18,
       };
       socketRef.current?.emit("wb:stroke", {
-        tool: tools.erase ? "eraser" : "pen",
+        tool: tools.tool === "eraser" ? "eraser" : "pen",
+        shape: "free",
         color: tools.color,
         size: tools.size,
-        // send normalized points
         points: batch,
       });
       batch = lastNorm ? [lastNorm] : [];
@@ -764,12 +908,24 @@ function WhiteboardCanvas({
       e.preventDefault();
       cvs.setPointerCapture(e.pointerId);
       setIsDown(true);
+      isDownRef.current = true;
       lastPt.current = null;
 
-      // seed batch with the initial point so receivers start at the right spot
-    const { nx, ny } = norm(e);
-    lastNorm = { x: nx, y: ny };
-    batch = [lastNorm];
+      const tools = (globalThis as any).__wbTools || { tool: "pen" };
+      const { nx, ny } = norm(e);
+      startNorm = { x: nx, y: ny };
+
+      if (tools.tool === "pen" || tools.tool === "eraser") {
+        // seed batch with initial point
+        lastNorm = { x: nx, y: ny };
+        batch = [lastNorm];
+      } else if (tools.tool === "text") {
+        // one-shot on up
+      } else {
+        // shapes: snapshot for preview
+        const ctx = cvs.getContext("2d")!;
+        snapshot = ctx.getImageData(0, 0, cvs.width, cvs.height);
+      }
     };
 
     const onUp = (e: PointerEvent) => {
@@ -778,75 +934,203 @@ function WhiteboardCanvas({
         cvs.releasePointerCapture(e.pointerId);
       } catch {}
       setIsDown(false);
-      lastPt.current = null;
-      flush();
+      isDownRef.current = false;
+      const tools = (globalThis as any).__wbTools || {
+        tool: "pen",
+        color: "#111",
+        size: 3,
+        text: "",
+        fontSize: 18,
+      };
+      const { nx, ny } = norm(e);
+      const endNorm = { x: nx, y: ny };
+
+      if (tools.tool === "pen" || tools.tool === "eraser") {
+        lastPt.current = null;
+        flush();
+      } else if (tools.tool === "text") {
+        if (!tools.text?.trim()) return;
+        // draw locally
+        const ctx = cvs.getContext("2d")!;
+        ctx.save();
+        ctx.globalCompositeOperation = "source-over";
+        ctx.fillStyle = tools.color;
+        ctx.font = `${Math.max(10, tools.fontSize)}px sans-serif`;
+        ctx.textBaseline = "top";
+        const rect = cvs.getBoundingClientRect();
+        ctx.fillText(
+          tools.text,
+          endNorm.x * rect.width,
+          endNorm.y * rect.height
+        );
+        ctx.restore();
+        // emit once
+        socketRef.current?.emit("wb:stroke", {
+          tool: "pen",
+          shape: "text",
+          color: tools.color,
+          fontSize: tools.fontSize,
+          size: tools.size,
+          text: tools.text,
+          points: [endNorm],
+        });
+      } else {
+        // finalize shape (line/rect/circle)
+        if (!startNorm) return;
+        const ctx = cvs.getContext("2d")!;
+        if (snapshot) ctx.putImageData(snapshot, 0, 0);
+        ctx.save();
+        ctx.globalCompositeOperation = "source-over";
+        ctx.strokeStyle = tools.color;
+        ctx.lineWidth = tools.size;
+        const rect = cvs.getBoundingClientRect();
+        const x1 = startNorm.x * rect.width,
+          y1 = startNorm.y * rect.height;
+        const x2 = endNorm.x * rect.width,
+          y2 = endNorm.y * rect.height;
+        if (tools.tool === "line") {
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        } else if (tools.tool === "rect") {
+          ctx.strokeRect(
+            Math.min(x1, x2),
+            Math.min(y1, y2),
+            Math.abs(x2 - x1),
+            Math.abs(y2 - y1)
+          );
+        } else {
+          const cx = (x1 + x2) / 2,
+            cy = (y1 + y2) / 2,
+            rx = Math.abs(x2 - x1) / 2,
+            ry = Math.abs(y2 - y1) / 2;
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.restore();
+
+       socketRef.current?.emit('wb:stroke', {
+      tool: 'pen',
+      shape: tools.tool === 'line' ? 'line' : (tools.tool === 'rect' ? 'rect' : 'circle'),
+      color: tools.color,
+      size: tools.size,
+      points: [startNorm, endNorm],
+    });
+    snapshot = null;
+  }
+      // reset batching vars
+      startNorm = null;
+      lastNorm = null;
+      batch = [];
       if (flushTimer) {
         clearTimeout(flushTimer);
         flushTimer = null;
       }
-      lastNorm = null;
-      batch = [];
     };
 
     const onMove = (e: PointerEvent) => {
-      if (!isDown) return;
+     
+      if (!isDownRef.current) return;
       const { x, y, nx, ny } = norm(e);
       const tools = (globalThis as any).__wbTools || {
+        tool: "pen",
         color: "#111",
         size: 3,
-        erase: false,
       };
-      // draw locally for instant feedback
-      if (lastPt.current) {
-        const ctx = cvs.getContext("2d")!;
+      const ctx = cvs.getContext("2d")!;
+
+      if (tools.tool === "pen" || tools.tool === "eraser") {
+        // local draw for pen/eraser
+        if (lastPt.current) {
+          ctx.save();
+          ctx.globalCompositeOperation = "source-over";
+          ctx.strokeStyle = tools.tool === "eraser" ? "#ffffff" : tools.color;
+          ctx.lineWidth = tools.size;
+          ctx.beginPath();
+          ctx.moveTo(lastPt.current.x, lastPt.current.y);
+          ctx.lineTo(x, y);
+          ctx.stroke();
+          ctx.restore();
+        }
+        lastPt.current = { x, y };
+        lastNorm = { x: nx, y: ny };
+        batch.push(lastNorm);
+        if (!flushTimer) {
+          flushTimer = setTimeout(() => {
+            flush();
+            flushTimer = null;
+          }, 50);
+        }
+      } else if (
+        tools.tool === "line" ||
+        tools.tool === "rect" ||
+        tools.tool === "circle"
+      ) {
+        // preview shape using snapshot
+        if (!snapshot || !startNorm) return;
+        ctx.putImageData(snapshot, 0, 0);
         ctx.save();
-         ctx.globalCompositeOperation = "source-over";
-         ctx.strokeStyle = tools.erase ? "#ffffff" : tools.color;
+        ctx.globalCompositeOperation = "source-over";
+        ctx.strokeStyle = tools.color;
         ctx.lineWidth = tools.size;
-        ctx.beginPath();
-        ctx.moveTo(lastPt.current.x, lastPt.current.y);
-        ctx.lineTo(x, y);
-        ctx.stroke();
+        const rect = cvs.getBoundingClientRect();
+        const x1 = startNorm.x * rect.width,
+          y1 = startNorm.y * rect.height;
+        const x2 = nx * rect.width,
+          y2 = ny * rect.height;
+        if (tools.tool === "line") {
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        } else if (tools.tool === "rect") {
+          ctx.strokeRect(
+            Math.min(x1, x2),
+            Math.min(y1, y2),
+            Math.abs(x2 - x1),
+            Math.abs(y2 - y1)
+          );
+        } else {
+          const cx = (x1 + x2) / 2,
+            cy = (y1 + y2) / 2,
+            rx = Math.abs(x2 - x1) / 2,
+            ry = Math.abs(y2 - y1) / 2;
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+          ctx.stroke();
+        }
         ctx.restore();
-      }
-      lastPt.current = { x, y };
-      // accumulate normalized points for this stroke
-
-      lastNorm = { x: nx, y: ny };
-      
-      batch.push(lastNorm);
-
-      // small debounce to send in short chunks
-      if (!flushTimer) {
-        flushTimer = setTimeout(() => {
-          flush();
-          flushTimer = null;
-        }, 50);
       }
     };
 
     cvs.addEventListener("pointerdown", onDown);
     cvs.addEventListener("pointerup", onUp);
     cvs.addEventListener("pointercancel", onUp);
+    cvs.addEventListener("pointerleave", onUp);
     cvs.addEventListener("pointermove", onMove);
     return () => {
       cvs.removeEventListener("pointerdown", onDown);
       cvs.removeEventListener("pointerup", onUp);
       cvs.removeEventListener("pointercancel", onUp);
+      cvs.removeEventListener("pointerleave", onUp);
       cvs.removeEventListener("pointermove", onMove);
     };
-  }, [socketRef, isDown, norm]);
+  }, [socketRef,  norm]);
 
   useEffect(() => {
     if (!publishFromCanvas || !lkRoom) return;
     const cvs = canvasRef.current;
     if (!cvs) return;
-  
+
     // 30fps canvas capture
-     const stream = cvs.captureStream(30);
-     const vtrack = stream.getVideoTracks()[0];
-     if (!vtrack) return;
-     try { (vtrack as any).contentHint = "detail"; } catch {}
+    const stream = cvs.captureStream(30);
+    const vtrack = stream.getVideoTracks()[0];
+    if (!vtrack) return;
+    try {
+      (vtrack as any).contentHint = "detail";
+    } catch {}
 
     let cancelled = false;
     (async () => {
@@ -856,14 +1140,15 @@ function WhiteboardCanvas({
           name: "Whiteboard",
         });
         if (!cancelled) publishedRef.current = pub;
-                const ctx = cvs.getContext("2d")!;
+        const ctx = cvs.getContext("2d")!;
         let toggle = false;
         keepAliveRef.current = window.setInterval(() => {
           // draw a 1px “heartbeat” in the bottom-right corner.
           // toggle between two whites so browsers treat it as a change.
           ctx.save();
           ctx.globalCompositeOperation = "source-over";
-          const px = cvs.clientWidth - 1, py = cvs.clientHeight - 1;
+          const px = cvs.clientWidth - 1,
+            py = cvs.clientHeight - 1;
           ctx.fillStyle = toggle ? "#ffffff" : "#fefefe";
           ctx.fillRect(px, py, 1, 1);
           ctx.restore();
@@ -872,30 +1157,37 @@ function WhiteboardCanvas({
       } catch (e) {
         // Publishing can fail if permissions change; safe to ignore here.
         console.warn("[wb] publish failed:", (e as any)?.message || e);
-        try { vtrack.stop(); } catch {}
+        try {
+          vtrack.stop();
+        } catch {}
       }
     })();
-  
+
     return () => {
       cancelled = true;
-            if (keepAliveRef.current) {
-                clearInterval(keepAliveRef.current);
-                keepAliveRef.current = null;
-              }
-         const pub = publishedRef.current;
-         publishedRef.current = null;
-         if (!lkRoom) return;
-         if (pub) {
-             const t = pub.track as LocalTrack | undefined;
-             if (t) {
-               try { lkRoom.localParticipant.unpublishTrack(t); } catch {}
-               try { t.stop(); } catch {}
-             }
-            }
-        
-         try { lkRoom.localParticipant.setScreenShareEnabled(false); } catch {}
+      if (keepAliveRef.current) {
+        clearInterval(keepAliveRef.current);
+        keepAliveRef.current = null;
       }
-   
+      const pub = publishedRef.current;
+      publishedRef.current = null;
+      if (!lkRoom) return;
+      if (pub) {
+        const t = pub.track as LocalTrack | undefined;
+        if (t) {
+          try {
+            lkRoom.localParticipant.unpublishTrack(t);
+          } catch {}
+          try {
+            t.stop();
+          } catch {}
+        }
+      }
+
+      try {
+        lkRoom.localParticipant.setScreenShareEnabled(false);
+      } catch {}
+    };
   }, [publishFromCanvas, lkRoom]);
 
   return (
@@ -1635,6 +1927,3 @@ function HlsPlayer({ src }: { src: string | null }) {
     />
   );
 }
-
-
-
