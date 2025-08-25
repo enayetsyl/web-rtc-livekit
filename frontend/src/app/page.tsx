@@ -130,7 +130,7 @@ export default function Page() {
 
     const waitForCanvas = async () => {
       // poll briefly until the canvas registered __wbOnStroke
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < 200; i++) {
         // ~6s worst case
         if ((globalThis as any).__wbReady && (globalThis as any).__wbOnStroke)
           return;
@@ -142,16 +142,29 @@ export default function Page() {
       await waitForCanvas();
       if (cancelled) return;
       try {
-        const u = new URL(`${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`);
+        const base = `${process.env.NEXT_PUBLIC_API_BASE}/api/wb/history`;
+
+        const u = new URL(base);
+
         u.searchParams.set("roomName", roomName);
         u.searchParams.set("sessionId", wbSessionId);
         const r = await fetch(u.toString(), { cache: "no-store" });
         const d = await r.json();
+
         if (!cancelled && d?.ok && Array.isArray(d.strokes)) {
-          (globalThis as any).__wbClearLocal?.();
-          for (const s of d.strokes) {
-            (globalThis as any).__wbOnStroke?.(s);
+          if (d.strokes.length === 0) {
+            const u2 = new URL(base);
+            u2.searchParams.set("roomName", roomName);
+            const r2 = await fetch(u2.toString(), { cache: "no-store" });
+            const d2 = await r2.json();
+            if (d2?.ok && Array.isArray(d2.strokes)) {
+              (globalThis as any).__wbClearLocal?.();
+              for (const s of d2.strokes) (globalThis as any).__wbOnStroke?.(s);
+              return;
+            }
           }
+          (globalThis as any).__wbClearLocal?.();
+          for (const s of d.strokes) (globalThis as any).__wbOnStroke?.(s);
         }
       } catch {}
     })();
@@ -218,7 +231,7 @@ export default function Page() {
     wbSocketRef.current = s;
 
     if (!(globalThis as any).__wbQueue) (globalThis as any).__wbQueue = [];
-  const q = (globalThis as any).__wbQueue as any[];
+    const q = (globalThis as any).__wbQueue as any[];
 
     async function waitForCanvasReady() {
       for (let i = 0; i < 100; i++) {
@@ -247,11 +260,19 @@ export default function Page() {
 
     // server pushes whether the board is open + current session id
     s.on("wb:state", (st: { open: boolean; sessionId?: string }) => {
+      const sid = typeof st.sessionId === "string" ? st.sessionId : null;
+
+      // set sessionId first so the wbOpen effect sees it
+      setWbSessionId(sid);
       setWbOpen(st.open);
-      if (typeof st.sessionId === "string") setWbSessionId(st.sessionId);
-      // If opened, hydrate immediately (prevents race for participants)
-      if (st.open && typeof st.sessionId === "string") {
-        hydrateWhiteboard(roomName, st.sessionId);
+
+      if (st.open && sid) {
+        // Ensure React has mounted <WhiteboardCanvas> before hydrating.
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            hydrateWhiteboard(roomName, sid);
+          });
+        });
       }
     });
 
@@ -285,10 +306,12 @@ export default function Page() {
     });
 
     s.on("connect", () => console.log("[wb] socket connected", s.id));
-s.on("disconnect", (reason) => console.warn("[wb] socket disconnected:", reason));
-s.on("connect_error", (err) =>
-  console.error("[wb] connect_error:", err?.message || err)
-);
+    s.on("disconnect", (reason) =>
+      console.warn("[wb] socket disconnected:", reason)
+    );
+    s.on("connect_error", (err) =>
+      console.error("[wb] connect_error:", err?.message || err)
+    );
     s.on("wb:clear", () => (globalThis as any).__wbClearLocal?.());
     s.on("wb:error", (msg: string) => console.warn("[wb:error]", msg));
 
@@ -701,8 +724,80 @@ function WhiteboardCanvas({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDown, setIsDown] = useState(false);
-  const isDownRef = useRef(false); 
+  const isDownRef = useRef(false);
   const lastPt = useRef<{ x: number; y: number } | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [textEditor, setTextEditor] = useState<null | {
+    left: number; // CSS px relative to canvas
+    top: number; // CSS px relative to canvas
+    nx: number; // normalized x (0..1)
+    ny: number; // normalized y (0..1)
+    value: string;
+  }>(null);
+
+  function getTools() {
+    const t = (globalThis as any).__wbTools || {};
+    return {
+      color: t.color ?? "#111",
+      size: Number(t.size ?? 3),
+      fontSize: Math.max(10, Number(t.fontSize ?? 18)),
+    };
+  }
+
+  function openTextEditorAt(clientX: number, clientY: number) {
+    const cvs = canvasRef.current!;
+    const rect = cvs.getBoundingClientRect();
+    const left = clientX - rect.left;
+    const top = clientY - rect.top;
+    const nx = left / rect.width;
+    const ny = top / rect.height;
+
+    setTextEditor({ left, top, nx, ny, value: "" });
+    // focus next tick so iOS/Chrome reliably open the keyboard
+    setTimeout(() => textAreaRef.current?.focus(), 0);
+  }
+
+  function commitText() {
+    if (!textEditor) return;
+    const val = (textEditor.value || "").trim();
+    const { color, size, fontSize } = getTools();
+    const cvs = canvasRef.current!;
+    const ctx = cvs.getContext("2d")!;
+    const rect = cvs.getBoundingClientRect();
+
+    if (val) {
+      // Draw locally (supports multi-line)
+      ctx.save();
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = color;
+      ctx.font = `${fontSize}px sans-serif`;
+      ctx.textBaseline = "top";
+
+      const lines = val.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        ctx.fillText(
+          lines[i],
+          textEditor.left,
+          textEditor.top + i * fontSize * 1.2
+        );
+      }
+      ctx.restore();
+
+      // Emit to everyone else using normalized origin point
+      socketRef.current?.emit("wb:stroke", {
+        tool: "pen",
+        shape: "text",
+        color,
+        fontSize,
+        size,
+        text: val,
+        points: [{ x: textEditor.nx, y: textEditor.ny }],
+      });
+    }
+
+    setTextEditor(null);
+  }
 
   const lkRoom = useContext(RoomContext);
 
@@ -760,7 +855,10 @@ function WhiteboardCanvas({
         const fs = Math.max(10, Number(doc.fontSize || 18));
         ctx.font = `${fs}px sans-serif`;
         ctx.textBaseline = "top";
-        ctx.fillText(String(doc.text || ""), p.x, p.y);
+        const lines = String(doc.text || "").split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+          ctx.fillText(lines[i], p.x, p.y + i * fs * 1.2);
+        }
       } else if (shape === "line") {
         if (pts.length >= 2) {
           ctx.beginPath();
@@ -828,44 +926,57 @@ function WhiteboardCanvas({
 
   // canvas resize
   useEffect(() => {
-    const cvs = canvasRef.current!;
-    const parent = cvs.parentElement!;
-    let firstSized = false;
-    const resize = () => {
-      const dpr = Math.max(1, window.devicePixelRatio || 1);
-      const w = parent.clientWidth;
-      const h = parent.clientHeight;
-      cvs.width = Math.floor(w * dpr);
-      cvs.height = Math.floor(h * dpr);
-      cvs.style.width = `${w}px`;
-      cvs.style.height = `${h}px`;
-      const ctx = cvs.getContext("2d")!;
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.scale(dpr, dpr);
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
+  const cvs = canvasRef.current!;
+  const parent = cvs.parentElement!;
+  let initialized = false;
+
+  const resize = () => {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const w = parent.clientWidth;
+    const h = parent.clientHeight;
+
+    // snapshot current pixels (device resolution)
+    const prevW = cvs.width;
+    const prevH = cvs.height;
+    let prevCanvas: HTMLCanvasElement | null = null;
+    if (prevW > 0 && prevH > 0) {
+      prevCanvas = document.createElement("canvas");
+      prevCanvas.width = prevW;
+      prevCanvas.height = prevH;
+      const pctx = prevCanvas.getContext("2d")!;
+      pctx.drawImage(cvs, 0, 0);
+    }
+
+    const newW = Math.floor(w * dpr);
+    const newH = Math.floor(h * dpr);
+    if (newW === prevW && newH === prevH) return;
+
+    cvs.width = newW;
+    cvs.height = newH;
+    cvs.style.width = `${w}px`;
+    cvs.style.height = `${h}px`;
+
+    const ctx = cvs.getContext("2d")!;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+
+    if (!initialized) {
+      // paint a white background only once
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, w, h);
-      firstSized = true;
-    };
-    resize();
-    const ro = new ResizeObserver(() => {
-      resize();
-      if (firstSized) {
-        // once sized, flush queued strokes (safe no-op if empty)
-        const q = (globalThis as any).__wbQueue as any[] | undefined;
-        if (q?.length) {
-          const draw = (globalThis as any).__wbOnStroke;
-          if (draw) {
-            for (const d of q) draw(d);
-            q.length = 0;
-          }
-        }
-      }
-    });
-    ro.observe(parent);
-    return () => ro.disconnect();
-  }, []);
+      initialized = true;
+    } else if (prevCanvas) {
+      // redraw the previous bitmap scaled to new CSS size
+      // NOTE: after ctx.scale(dpr,dpr), coordinates are in CSS px
+      ctx.drawImage(prevCanvas, 0, 0, prevW, prevH, 0, 0, w, h);
+    }
+  };
+
+  resize();
+  const ro = new ResizeObserver(resize);
+  ro.observe(parent);
+  return () => ro.disconnect();
+}, []);
 
   const norm = useCallback((e: PointerEvent) => {
     const cvs = canvasRef.current!;
@@ -912,17 +1023,19 @@ function WhiteboardCanvas({
       lastPt.current = null;
 
       const tools = (globalThis as any).__wbTools || { tool: "pen" };
+
+      if (tools.tool === "text") {
+        openTextEditorAt(e.clientX, e.clientY);
+        return;
+      }
+
       const { nx, ny } = norm(e);
       startNorm = { x: nx, y: ny };
 
       if (tools.tool === "pen" || tools.tool === "eraser") {
-        // seed batch with initial point
         lastNorm = { x: nx, y: ny };
         batch = [lastNorm];
-      } else if (tools.tool === "text") {
-        // one-shot on up
       } else {
-        // shapes: snapshot for preview
         const ctx = cvs.getContext("2d")!;
         snapshot = ctx.getImageData(0, 0, cvs.width, cvs.height);
       }
@@ -930,11 +1043,6 @@ function WhiteboardCanvas({
 
     const onUp = (e: PointerEvent) => {
       e.preventDefault();
-      try {
-        cvs.releasePointerCapture(e.pointerId);
-      } catch {}
-      setIsDown(false);
-      isDownRef.current = false;
       const tools = (globalThis as any).__wbTools || {
         tool: "pen",
         color: "#111",
@@ -942,6 +1050,21 @@ function WhiteboardCanvas({
         text: "",
         fontSize: 18,
       };
+
+      // ⬇️ NEW: text tool is handled by inline editor; nothing to do here
+      if (tools.tool === "text") return;
+      try {
+        cvs.releasePointerCapture(e.pointerId);
+      } catch {}
+      setIsDown(false);
+      isDownRef.current = false;
+      // const tools = (globalThis as any).__wbTools || {
+      //   tool: "pen",
+      //   color: "#111",
+      //   size: 3,
+      //   text: "",
+      //   fontSize: 18,
+      // };
       const { nx, ny } = norm(e);
       const endNorm = { x: nx, y: ny };
 
@@ -1011,15 +1134,20 @@ function WhiteboardCanvas({
         }
         ctx.restore();
 
-       socketRef.current?.emit('wb:stroke', {
-      tool: 'pen',
-      shape: tools.tool === 'line' ? 'line' : (tools.tool === 'rect' ? 'rect' : 'circle'),
-      color: tools.color,
-      size: tools.size,
-      points: [startNorm, endNorm],
-    });
-    snapshot = null;
-  }
+        socketRef.current?.emit("wb:stroke", {
+          tool: "pen",
+          shape:
+            tools.tool === "line"
+              ? "line"
+              : tools.tool === "rect"
+              ? "rect"
+              : "circle",
+          color: tools.color,
+          size: tools.size,
+          points: [startNorm, endNorm],
+        });
+        snapshot = null;
+      }
       // reset batching vars
       startNorm = null;
       lastNorm = null;
@@ -1031,7 +1159,6 @@ function WhiteboardCanvas({
     };
 
     const onMove = (e: PointerEvent) => {
-     
       if (!isDownRef.current) return;
       const { x, y, nx, ny } = norm(e);
       const tools = (globalThis as any).__wbTools || {
@@ -1117,7 +1244,7 @@ function WhiteboardCanvas({
       cvs.removeEventListener("pointerleave", onUp);
       cvs.removeEventListener("pointermove", onMove);
     };
-  }, [socketRef,  norm]);
+  }, [socketRef, norm]);
 
   useEffect(() => {
     if (!publishFromCanvas || !lkRoom) return;
@@ -1191,16 +1318,59 @@ function WhiteboardCanvas({
   }, [publishFromCanvas, lkRoom]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{
-        width: "100%",
-        height: "100%",
-        cursor: "crosshair",
-        touchAction: "none",
-        background: "white",
-      }}
-    />
+    <div
+      ref={wrapRef}
+      style={{ position: "relative", width: "100%", height: "100%" }}
+    >
+      <canvas
+        ref={canvasRef}
+        style={{
+          width: "100%",
+          height: "100%",
+          cursor: "crosshair",
+          touchAction: "none",
+          background: "white",
+        }}
+      />
+      {textEditor && (
+        <textarea
+          ref={textAreaRef}
+          value={textEditor.value}
+          onChange={(e) =>
+            setTextEditor((t) => (t ? { ...t, value: e.target.value } : t))
+          }
+          onKeyDown={(e) => {
+            // Enter = commit, Shift+Enter = new line, Esc = cancel
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              commitText();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              setTextEditor(null);
+            }
+          }}
+          onBlur={commitText}
+          style={{
+            position: "absolute",
+            left: textEditor.left,
+            top: textEditor.top,
+            minWidth: 160,
+            maxWidth: "80%",
+            color: getTools().color,
+            font: `${getTools().fontSize}px sans-serif`,
+            lineHeight: 1.2,
+            padding: 0,
+            margin: 0,
+            border: "1px dashed #888",
+            outline: "none",
+            background: "rgba(255,255,255,0.9)",
+            resize: "both",
+            zIndex: 11, // above canvas & toolbar
+          }}
+          rows={1}
+        />
+      )}
+    </div>
   );
 }
 
